@@ -17,6 +17,7 @@ never the child's intermediate tool calls or reasoning.
 """
 
 import enum
+import fnmatch
 import json
 import logging
 
@@ -484,6 +485,107 @@ def _get_inherit_mcp_toolsets() -> bool:
     """Whether narrowed child toolsets should keep the parent's MCP toolsets."""
     cfg = _load_config()
     return is_truthy_value(cfg.get("inherit_mcp_toolsets"), default=True)
+
+
+def _get_parent_provider_only() -> bool:
+    """Check if delegation.parent_provider_only is set in config.
+
+    When True, all subagents MUST use the same provider as the parent.
+    This is a strict lock — no provider override is allowed.
+    """
+    cfg = _load_config()
+    return is_truthy_value(cfg.get("parent_provider_only"), default=False)
+
+
+def _get_allowed_providers() -> Optional[List[str]]:
+    """Read delegation.allowed_providers from config.
+
+    Returns None if not configured (no restriction).
+    Returns an empty list if set but empty (reject all).
+    Returns a list of allowed provider names if configured.
+    """
+    cfg = _load_config()
+    val = cfg.get("allowed_providers")
+    if val is None:
+        return None
+    if isinstance(val, list):
+        return val
+    if isinstance(val, str):
+        return [p.strip() for p in val.split(",") if p.strip()]
+    logger.warning("delegation.allowed_providers has invalid type %r; ignoring", type(val).__name__)
+    return None
+
+
+def _get_allowed_models() -> Optional[List[str]]:
+    """Read delegation.allowed_models from config.
+
+    Returns None if not configured (no restriction).
+    Returns an empty list if set but empty (reject all).
+    Returns a list of allowed model names if configured.
+    Supports glob patterns: '*' matches all, 'anthropic/*' matches all anthropic models.
+    """
+    cfg = _load_config()
+    val = cfg.get("allowed_models")
+    if val is None:
+        return None
+    if isinstance(val, list):
+        return val
+    if isinstance(val, str):
+        return [m.strip() for m in val.split(",") if m.strip()]
+    logger.warning("delegation.allowed_models has invalid type %r; ignoring", type(val).__name__)
+    return None
+
+
+def _validate_delegation_provider_model(
+    task_provider: Optional[str],
+    task_model: Optional[str],
+    parent_provider: str,
+    task_index: int,
+) -> Optional[str]:
+    """Validate that a child's provider/model are within configured bounds.
+
+    Returns an error message string if validation fails, None if OK.
+    """
+    # Check parent_provider_only first (strictest rule)
+    if _get_parent_provider_only():
+        effective_child_provider = task_provider or parent_provider
+        if effective_child_provider != parent_provider:
+            return (
+                f"Subagent {task_index}: provider '{effective_child_provider}' is not allowed "
+                f"because delegation.parent_provider_only is true (parent provider is '{parent_provider}'). "
+                f"Either remove parent_provider_only from config, or use provider='{parent_provider}'."
+            )
+
+    # Check allowed_providers whitelist
+    allowed_providers = _get_allowed_providers()
+    if allowed_providers is not None:
+        effective_child_provider = task_provider or parent_provider
+        if allowed_providers:  # non-empty list means whitelist is active
+            if effective_child_provider not in allowed_providers:
+                return (
+                    f"Subagent {task_index}: provider '{effective_child_provider}' is not in "
+                    f"delegation.allowed_providers ({allowed_providers}). "
+                    f"Allowed providers: {allowed_providers}."
+                )
+
+    # Check allowed_models whitelist
+    allowed_models = _get_allowed_models()
+    if allowed_models is not None:
+        if task_model:  # Only validate if a specific model is set
+            # Check if the model matches any allowed pattern
+            matched = False
+            for pattern in allowed_models:
+                if fnmatch.fnmatch(task_model, pattern):
+                    matched = True
+                    break
+            if not matched:
+                return (
+                    f"Subagent {task_index}: model '{task_model}' is not in "
+                    f"delegation.allowed_models ({allowed_models}). "
+                    f"Allowed models: {allowed_models}."
+                )
+
+    return None
 
 
 def _is_mcp_toolset_name(name: str) -> bool:
@@ -1974,6 +2076,8 @@ def delegate_task(
     acp_command: Optional[str] = None,
     acp_args: Optional[List[str]] = None,
     role: Optional[str] = None,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -1987,6 +2091,11 @@ def delegate_task(
     'leaf' (default) cannot; 'orchestrator' retains the delegation
     toolset and can spawn its own workers, bounded by
     delegation.max_spawn_depth.  Per-task role beats the top-level one.
+
+    The 'model' and 'provider' parameters let you route subagents to a
+    specific LLM model or provider (e.g. a cheaper model for simple tasks).
+    Per-task model/provider beats the top-level ones, which beat the
+    config-level ``delegation.model`` / ``delegation.provider``.
 
     Returns JSON with results array, one entry per task.
     """
@@ -2099,6 +2208,25 @@ def delegate_task(
 
     _parent_tool_names = list(_model_tools._last_resolved_tool_names)
 
+     # Resolve per-task model/provider: per-task > top-level > config.
+    # This lets the caller pick a cheaper model for simple tasks or a
+    # specific provider for routing, without touching config.yaml.
+    top_level_model = model
+    top_level_provider = provider
+    # Get the parent's provider for validation (parent_provider_only, allowed_providers).
+    parent_provider = None
+    if parent_agent is not None:
+        parent_provider = getattr(parent_agent, "provider", None)
+    if not parent_provider:
+        # Fallback: resolve via credential pool
+        try:
+            _creds = _resolve_child_credential_pool(None, parent_agent)
+            parent_provider = _creds.get("provider") if isinstance(_creds, dict) else None
+        except Exception:
+            pass
+    if not parent_provider:
+        parent_provider = "default"  # safety fallback
+
     # Build all child agents on the main thread (thread-safe construction)
     # Wrapped in try/finally so the global is always restored even if a
     # child build raises (otherwise _last_resolved_tool_names stays corrupted).
@@ -2109,16 +2237,27 @@ def delegate_task(
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
             effective_role = _normalize_role(t.get("role") or top_role)
+            # Per-task model/provider beats top-level, which beats config.
+            task_model = t.get("model") or top_level_model or creds["model"]
+            task_provider = t.get("provider") or top_level_provider or creds["provider"]
+            # Validate provider/model against configured whitelist.
+            error = _validate_delegation_provider_model(
+                task_provider, task_model, parent_provider, i
+            )
+            if error:
+                results.append({"error": error, "subagent_id": None})
+                logger.warning("Delegation blocked: %s", error)
+                continue
             child = _build_child_agent(
                 task_index=i,
                 goal=t["goal"],
                 context=t.get("context"),
                 toolsets=t.get("toolsets") or toolsets,
-                model=creds["model"],
+                model=task_model,
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
                 parent_agent=parent_agent,
-                override_provider=creds["provider"],
+                override_provider=task_provider,
                 override_base_url=creds["base_url"],
                 override_api_key=creds["api_key"],
                 override_api_mode=creds["api_mode"],
@@ -2795,6 +2934,14 @@ DELEGATE_TASK_SCHEMA = {
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
                         },
+                        "model": {
+                            "type": "string",
+                            "description": "Per-task LLM model override (e.g. 'openrouter/anthropic/claude-sonnet-4'). Beats top-level model, which beats config.",
+                        },
+                        "provider": {
+                            "type": "string",
+                            "description": "Per-task LLM provider override (e.g. 'openrouter', 'anthropic', 'nous'). Beats top-level provider, which beats config.",
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -2830,6 +2977,22 @@ DELEGATE_TASK_SCHEMA = {
                     "Leave empty unless acp_command is explicitly provided."
                 ),
             },
+            "model": {
+                "type": "string",
+                "description": (
+                    "Override the LLM model for subagents (e.g. 'openrouter/anthropic/claude-sonnet-4'). "
+                    "Per-task model beats this, which beats config-level delegation.model. "
+                    "Useful for routing simple tasks to cheaper models or specific providers."
+                ),
+            },
+            "provider": {
+                "type": "string",
+                "description": (
+                    "Override the LLM provider for subagents (e.g. 'openrouter', 'anthropic', 'nous'). "
+                    "Per-task provider beats this, which beats config-level delegation.provider. "
+                    "When set, the child routes to that provider's endpoint instead of inheriting the parent's."
+                ),
+            },
         },
         "required": [],
     },
@@ -2852,6 +3015,8 @@ registry.register(
         acp_command=args.get("acp_command"),
         acp_args=args.get("acp_args"),
         role=args.get("role"),
+        model=args.get("model"),
+        provider=args.get("provider"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,
