@@ -536,56 +536,102 @@ def _get_allowed_models() -> Optional[List[str]]:
     return None
 
 
-def _validate_delegation_provider_model(
+def _get_allowed_models_info() -> Optional[Dict[str, str]]:
+    """Read delegation.allowed_models_info from config.
+
+    Returns None if not configured.
+    Returns a dict mapping model patterns to descriptions.
+    Used to provide the delegator with a curated list of allowed models.
+    """
+    cfg = _load_config()
+    val = cfg.get("allowed_models_info")
+    if val is None:
+        return None
+    if isinstance(val, dict):
+        return val
+    logger.warning("delegation.allowed_models_info has invalid type %r; ignoring", type(val).__name__)
+    return None
+
+
+def _validate_and_correct_delegation(
     task_provider: Optional[str],
     task_model: Optional[str],
     parent_provider: str,
+    parent_model: Optional[str],
     task_index: int,
-) -> Optional[str]:
+) -> tuple:
     """Validate that a child's provider/model are within configured bounds.
 
-    Returns an error message string if validation fails, None if OK.
+    Auto-corrects when a fallback is available (e.g., falls back to parent
+    provider when parent_provider_only is set). Returns a tuple of
+    (corrected_provider, corrected_model, error_or_none).
     """
+    effective_provider = task_provider or parent_provider
+    effective_model = task_model
+
     # Check parent_provider_only first (strictest rule)
     if _get_parent_provider_only():
-        effective_child_provider = task_provider or parent_provider
-        if effective_child_provider != parent_provider:
-            return (
-                f"Subagent {task_index}: provider '{effective_child_provider}' is not allowed "
-                f"because delegation.parent_provider_only is true (parent provider is '{parent_provider}'). "
-                f"Either remove parent_provider_only from config, or use provider='{parent_provider}'."
+        if effective_provider != parent_provider:
+            logger.warning(
+                "Subagent %d: delegation.parent_provider_only is true — "
+                "auto-correcting provider from '%s' to '%s' (parent's provider).",
+                task_index, effective_provider, parent_provider,
             )
+            effective_provider = parent_provider
+            task_provider = parent_provider  # update so downstream sees it
 
     # Check allowed_providers whitelist
     allowed_providers = _get_allowed_providers()
-    if allowed_providers is not None:
-        effective_child_provider = task_provider or parent_provider
-        if allowed_providers:  # non-empty list means whitelist is active
-            if effective_child_provider not in allowed_providers:
+    if allowed_providers is not None and allowed_providers:
+        if effective_provider not in allowed_providers:
+            # Try to auto-correct: fall back to parent's provider if it's in the whitelist
+            if parent_provider in allowed_providers:
+                logger.warning(
+                    "Subagent %d: provider '%s' not in delegation.allowed_providers — "
+                    "auto-correcting to '%s' (parent's provider).",
+                    task_index, effective_provider, parent_provider,
+                )
+                effective_provider = parent_provider
+                task_provider = parent_provider
+            else:
+                # Config error — parent's provider is also blocked
                 return (
-                    f"Subagent {task_index}: provider '{effective_child_provider}' is not in "
-                    f"delegation.allowed_providers ({allowed_providers}). "
-                    f"Allowed providers: {allowed_providers}."
+                    task_provider or parent_provider,
+                    task_model,
+                    (
+                        f"Subagent {task_index}: delegation.allowed_providers ({allowed_providers}) "
+                        f"blocks provider '{effective_provider}' and parent provider "
+                        f"'{parent_provider}' is also not allowed. Fix your config."
+                    ),
                 )
 
     # Check allowed_models whitelist
     allowed_models = _get_allowed_models()
-    if allowed_models is not None:
-        if task_model:  # Only validate if a specific model is set
-            # Check if the model matches any allowed pattern
-            matched = False
-            for pattern in allowed_models:
-                if fnmatch.fnmatch(task_model, pattern):
-                    matched = True
-                    break
-            if not matched:
+    if allowed_models is not None and effective_model:
+        matched = any(fnmatch.fnmatch(effective_model, p) for p in allowed_models)
+        if not matched:
+            # Auto-correct: fall back to parent's model (which is presumably allowed)
+            if parent_model and any(fnmatch.fnmatch(parent_model, p) for p in allowed_models):
+                logger.warning(
+                    "Subagent %d: model '%s' not in delegation.allowed_models — "
+                    "auto-correcting to '%s' (parent's model).",
+                    task_index, effective_model, parent_model,
+                )
+                effective_model = parent_model
+                task_model = parent_model
+            else:
+                # Config error — parent's model is also not allowed
                 return (
-                    f"Subagent {task_index}: model '{task_model}' is not in "
-                    f"delegation.allowed_models ({allowed_models}). "
-                    f"Allowed models: {allowed_models}."
+                    task_provider or parent_provider,
+                    task_model,
+                    (
+                        f"Subagent {task_index}: delegation.allowed_models ({allowed_models}) "
+                        f"blocks model '{effective_model}' and parent model "
+                        f"'{parent_model}' is also not allowed. Fix your config."
+                    ),
                 )
 
-    return None
+    return (task_provider or parent_provider, task_model, None)
 
 
 def _is_mcp_toolset_name(name: str) -> bool:
@@ -2213,10 +2259,12 @@ def delegate_task(
     # specific provider for routing, without touching config.yaml.
     top_level_model = model
     top_level_provider = provider
-    # Get the parent's provider for validation (parent_provider_only, allowed_providers).
+      # Get the parent's provider/model for validation (parent_provider_only, allowed_providers).
     parent_provider = None
+    parent_model = None
     if parent_agent is not None:
         parent_provider = getattr(parent_agent, "provider", None)
+        parent_model = getattr(parent_agent, "model", None)
     if not parent_provider:
         # Fallback: resolve via credential pool
         try:
@@ -2226,6 +2274,10 @@ def delegate_task(
             pass
     if not parent_provider:
         parent_provider = "default"  # safety fallback
+    if not parent_model and parent_agent is not None:
+        parent_model = getattr(parent_agent, "model", None)
+    if not parent_model:
+        parent_model = "default"  # safety fallback
 
     # Build all child agents on the main thread (thread-safe construction)
     # Wrapped in try/finally so the global is always restored even if a
@@ -2241,13 +2293,14 @@ def delegate_task(
             task_model = t.get("model") or top_level_model or creds["model"]
             task_provider = t.get("provider") or top_level_provider or creds["provider"]
             # Validate provider/model against configured whitelist.
-            error = _validate_delegation_provider_model(
-                task_provider, task_model, parent_provider, i
+            error = _validate_and_correct_delegation(
+                task_provider, task_model, parent_provider, parent_model, i
             )
-            if error:
-                results.append({"error": error, "subagent_id": None})
-                logger.warning("Delegation blocked: %s", error)
+            if error[2]:  # error string present
+                results.append({"error": error[2], "subagent_id": None})
+                logger.warning("Delegation blocked: %s", error[2])
                 continue
+            task_provider, task_model, _ = error
             child = _build_child_agent(
                 task_index=i,
                 goal=t["goal"],
@@ -2792,8 +2845,21 @@ def _build_tasks_param_description() -> str:
         f"Batch mode: tasks to run in parallel (up to {max_children} for this "
         f"user, set via delegation.max_concurrent_children). Each gets "
         "its own subagent with isolated context and terminal session. "
-        "When provided, top-level goal/context/toolsets are ignored."
+        "When provided, top-level goal/context/toolsets are ignored. "
+        "If delegation.allowed_models_info is configured, the delegator will see "
+        "a curated list of allowed models with descriptions to help it choose."
     )
+
+
+def _build_model_param_description() -> str:
+    """Compose the 'model' parameter description with allowed_models_info if configured."""
+    allowed_info = _get_allowed_models_info()
+    if allowed_info:
+        lines = ["Allowed models (choose from this list):"]
+        for pattern, desc in allowed_info.items():
+            lines.append(f"  - {pattern}: {desc}")
+        return "Override the LLM model for subagents. " + "\n".join(lines)
+    return "Override the LLM model for subagents."
 
 
 def _build_role_param_description() -> str:
@@ -2849,6 +2915,9 @@ def _build_dynamic_schema_overrides() -> dict:
     }
     overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
     overrides_params["properties"]["role"]["description"] = _build_role_param_description()
+    # Inject allowed_models_info into the model parameter description
+    if _get_allowed_models_info():
+        overrides_params["properties"]["model"]["description"] = _build_model_param_description()
     return {
         "description": _build_top_level_description(),
         "parameters": overrides_params,
@@ -2985,12 +3054,14 @@ DELEGATE_TASK_SCHEMA = {
                     "Useful for routing simple tasks to cheaper models or specific providers."
                 ),
             },
-            "provider": {
+             "provider": {
                 "type": "string",
                 "description": (
                     "Override the LLM provider for subagents (e.g. 'openrouter', 'anthropic', 'nous'). "
                     "Per-task provider beats this, which beats config-level delegation.provider. "
-                    "When set, the child routes to that provider's endpoint instead of inheriting the parent's."
+                    "When set, the child routes to that provider's endpoint instead of inheriting the parent's. "
+                    "Note: if delegation.allowed_models_info is configured, the delegator will see a curated "
+                    "list of allowed models with descriptions to help it choose wisely."
                 ),
             },
         },
