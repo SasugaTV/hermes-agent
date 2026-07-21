@@ -682,11 +682,12 @@ def test_run_agent_dispatch_forces_background():
         assert captured["background"] is False
 
 
-def test_dispatch_never_forwards_model_toolsets():
-    """The model has no toolsets argument — subagents always inherit the
-    parent's toolsets. Even if a model smuggles a `toolsets` key into the
-    tool-call args, the live dispatch path must NOT forward it to
-    delegate_task (which no longer accepts it) and must not crash."""
+def test_dispatch_forwards_model_toolsets():
+    """Local fork divergence from upstream ba0bc01d1 (#56386): this fork
+    intentionally keeps `toolsets` model-facing so a manager agent can narrow
+    a delegated sub-agent's tool surface (patch/delegate-task-model-toolsets
+    on the fork remote). The live dispatch path must forward a model-provided
+    `toolsets` key through to delegate_task unchanged."""
     from unittest.mock import patch
     import run_agent
 
@@ -703,7 +704,7 @@ def test_dispatch_never_forwards_model_toolsets():
         run_agent.AIAgent._dispatch_delegate_task(
             _FakeAgent(), {"goal": "x", "toolsets": ["web", "terminal"]}
         )
-    assert "toolsets" not in captured
+    assert captured["toolsets"] == ["web", "terminal"]
 
 
 def test_delegate_task_background_detaches_child_from_parent(monkeypatch):
