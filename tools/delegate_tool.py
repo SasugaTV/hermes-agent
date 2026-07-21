@@ -520,6 +520,47 @@ def _get_orchestrator_enabled() -> bool:
     return True
 
 
+class DelegationProviderNotAllowedError(RuntimeError):
+    """Raised when a delegated sub-agent would be routed to a cloud provider
+    that isn't on the ``delegation.cloud_provider_allowlist``.
+
+    This is the hard, non-bypassable admission-control guardrail: it fires
+    during child construction, before any request is ever built or sent, so
+    no partial work happens. It complements (does not replace)
+    ``redact.redact_outbound_payload`` — that scrubs secrets from whatever
+    *does* reach an approved cloud provider; this decides which providers a
+    delegated sub-agent may reach at all.
+    """
+
+
+def _get_cloud_provider_allowlist() -> Optional[frozenset]:
+    """Read delegation.cloud_provider_allowlist from config.
+
+    Flat, global allowlist of provider names (case-insensitive) any
+    delegated sub-agent may be routed to for a non-local base_url. Local
+    endpoints (see ``model_metadata.is_local_endpoint`` -- loopback,
+    RFC-1918, Tailscale CGNAT, container-internal DNS) are never gated by
+    this at all; the allowlist only governs traffic that would otherwise
+    leave the machine.
+
+    Returns None (unrestricted -- current behavior, no gate applied) when the
+    key is absent entirely, so existing setups keep working until the user
+    opts in. An explicit empty list (``[]``) is a deliberate "no cloud
+    provider approved" lockout, distinct from omitting the key.
+    """
+    cfg = _load_config()
+    if "cloud_provider_allowlist" not in cfg:
+        return None
+    val = cfg.get("cloud_provider_allowlist")
+    if not isinstance(val, list):
+        logger.warning(
+            "delegation.cloud_provider_allowlist=%r is not a list; ignoring (unrestricted)",
+            val,
+        )
+        return None
+    return frozenset(str(p).strip().lower() for p in val if str(p or "").strip())
+
+
 def _get_inherit_mcp_toolsets() -> bool:
     """Whether narrowed child toolsets should keep the parent's MCP toolsets."""
     cfg = _load_config()
@@ -1316,6 +1357,25 @@ def _build_child_agent(
     child_optional_kwargs: Dict[str, Any] = {}
     if isinstance(child_max_tokens, int):
         child_optional_kwargs["max_tokens"] = child_max_tokens
+
+    # Cloud-provider admission gate — checked last, against the fully
+    # resolved effective_provider/effective_base_url (after the
+    # override_acp_command force-override above, so a copilot-acp reroute
+    # can't slip past this unchecked). No-op when
+    # delegation.cloud_provider_allowlist is unset; local endpoints are
+    # never gated. See DelegationProviderNotAllowedError.
+    from agent.model_metadata import is_local_endpoint
+    if effective_provider and not is_local_endpoint(effective_base_url or ""):
+        _allowlist = _get_cloud_provider_allowlist()
+        if _allowlist is not None and effective_provider.strip().lower() not in _allowlist:
+            raise DelegationProviderNotAllowedError(
+                f"Refusing to spawn sub-agent on provider {effective_provider!r} "
+                f"(base_url={effective_base_url!r}): not on "
+                f"delegation.cloud_provider_allowlist. Add it to config.yaml under "
+                f"delegation.cloud_provider_allowlist to approve this provider for "
+                f"delegated sub-agents, or omit the key entirely to leave delegation "
+                f"unrestricted."
+            )
 
     child = AIAgent(
         base_url=effective_base_url,
@@ -2369,6 +2429,7 @@ def _recover_tasks_from_json_string(
 def delegate_task(
     goal: Optional[str] = None,
     context: Optional[str] = None,
+    toolsets: Optional[List[str]] = None,
     tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
@@ -2381,6 +2442,12 @@ def delegate_task(
     Supports two modes:
       - Single: provide goal (+ optional context, toolsets, role)
       - Batch:  provide tasks array [{goal, context, toolsets, role}, ...]
+
+    'toolsets' (top-level or per-task) narrows the child's tool access to a
+    subset of the parent's own enabled toolsets -- e.g. ["web"] or
+    ["terminal", "file"]. Names outside the parent's available set are
+    silently dropped (see _expand_parent_toolsets). Omit to inherit every
+    toolset the parent has.
 
     The 'role' parameter controls whether a child can further delegate:
     'leaf' (default) cannot; 'orchestrator' retains the delegation
@@ -2473,7 +2540,7 @@ def delegate_task(
             )
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
-        task_list = [{"goal": goal, "context": context, "role": top_role}]
+        task_list = [{"goal": goal, "context": context, "role": top_role, "toolsets": toolsets}]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
 
@@ -2516,9 +2583,10 @@ def delegate_task(
                 task_index=i,
                 goal=t["goal"],
                 context=t.get("context"),
-                # Subagents always inherit the parent's toolsets; the model
-                # cannot choose or narrow them (no model-facing toolsets arg).
-                toolsets=None,
+                # Per-task toolsets beats the top-level one; both are
+                # optional -- omitting either falls through to full
+                # inheritance of the parent's enabled toolsets.
+                toolsets=t.get("toolsets") or None,
                 model=creds["model"],
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
@@ -3387,6 +3455,21 @@ def _build_dynamic_schema_overrides() -> dict:
     }
 
 
+# Toolset category names offered to the model for scoping a subagent.
+# Excludes platform composites (hermes-*), the "all"/"*" aliases, and
+# toolsets leaf/orchestrator subagents can never use anyway (delegation,
+# clarify, memory, code_execution — see DELEGATE_BLOCKED_TOOLS /
+# _strip_blocked_tools) so the model isn't offered options that get
+# silently stripped. Computed once at import time from the live TOOLSETS
+# registry so it self-updates as toolsets are added upstream.
+_DELEGATABLE_TOOLSET_NAMES = sorted(
+    name
+    for name in TOOLSETS
+    if not name.startswith("hermes-")
+    and name not in {"all", "*", "delegation", "clarify", "memory", "code_execution"}
+)
+
+
 DELEGATE_TASK_SCHEMA = {
     "name": "delegate_task",
     # NOTE: description / tasks.description / role.description are placeholder
@@ -3421,6 +3504,23 @@ DELEGATE_TASK_SCHEMA = {
                     "specific you are, the better the subagent performs."
                 ),
             },
+            "toolsets": {
+                "type": "array",
+                "items": {"type": "string", "enum": _DELEGATABLE_TOOLSET_NAMES},
+                "description": (
+                    "Narrow this subagent's tools to just these toolset "
+                    "categories, e.g. [\"web\"] for research or [\"terminal\", "
+                    "\"file\"] for code changes. Keep the list as small as the "
+                    "job allows -- a focused subagent uses less of its own "
+                    "context window per turn. If a job genuinely needs more "
+                    "categories than that, prefer splitting it into multiple "
+                    "delegate_task calls (or tasks[] entries) that each own one "
+                    "part of the job with their own narrow toolsets, rather "
+                    "than granting one subagent everything. Names outside your "
+                    "own enabled toolsets are dropped. Omit to inherit all of "
+                    "your toolsets."
+                ),
+            },
             "tasks": {
                 "type": "array",
                 "items": {
@@ -3430,6 +3530,11 @@ DELEGATE_TASK_SCHEMA = {
                         "context": {
                             "type": "string",
                             "description": "Task-specific context",
+                        },
+                        "toolsets": {
+                            "type": "array",
+                            "items": {"type": "string", "enum": _DELEGATABLE_TOOLSET_NAMES},
+                            "description": "Per-task toolsets override. See top-level 'toolsets' for semantics.",
                         },
                         "role": {
                             "type": "string",
@@ -3516,6 +3621,7 @@ registry.register(
     handler=lambda args, **kw: delegate_task(
         goal=args.get("goal"),
         context=args.get("context"),
+        toolsets=args.get("toolsets"),
         tasks=_strip_model_hidden_task_fields(args.get("tasks")),
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),

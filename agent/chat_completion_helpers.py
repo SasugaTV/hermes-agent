@@ -794,6 +794,33 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
 
 def build_api_kwargs(agent, api_messages: list) -> dict:
+    """Build the keyword arguments dict for the active API mode, then apply
+    the outbound-payload guard before any dispatch path can send it.
+
+    This is the single point every dispatch path funnels through — streaming,
+    non-streaming, retries, and fallback activation all call this (via
+    ``run_agent.AIAgent._build_api_kwargs``) to construct ``api_kwargs``
+    before making the actual request, so hooking here covers all of them at
+    once rather than needing a guard at each individual send call-site.
+
+    When ``agent.base_url`` is not a local/trusted endpoint (see
+    ``model_metadata.is_local_endpoint`` — loopback, RFC-1918, Tailscale
+    CGNAT, container-internal DNS all count as local/trusted), the returned
+    kwargs are passed through ``agent.redact.redact_outbound_payload``
+    before being handed back. This is a hard boundary: no try/except here,
+    deliberately — if the redaction machinery itself fails, the exception
+    propagates and the request is never sent, rather than silently going out
+    unredacted.
+    """
+    api_kwargs = _build_api_kwargs_for_mode(agent, api_messages)
+    from agent.model_metadata import is_local_endpoint
+    if not is_local_endpoint(getattr(agent, "base_url", "") or ""):
+        from agent.redact import redact_outbound_payload
+        api_kwargs = redact_outbound_payload(api_kwargs, force=True)
+    return api_kwargs
+
+
+def _build_api_kwargs_for_mode(agent, api_messages: list) -> dict:
     """Build the keyword arguments dict for the active API mode."""
     tools_for_api = agent.tools
 

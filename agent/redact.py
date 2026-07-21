@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import shlex
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -680,6 +681,58 @@ def redact_sensitive_text(
         text = _SIGNAL_PHONE_RE.sub(_redact_phone, text)
 
     return text
+
+
+# Content-block ``type`` values that mark an opaque binary/media attachment
+# (base64 image or audio data). Matches the set ``_content_has_image_parts``
+# recognizes in run_agent.py, plus audio for defense-in-depth.
+_MEDIA_BLOCK_TYPES = frozenset({"image", "image_url", "input_image", "audio", "input_audio"})
+
+# Defensive recursion cap — real api_kwargs payloads never nest anywhere
+# close to this deep; it only guards against a pathological/cyclic structure.
+_MAX_REDACT_PAYLOAD_DEPTH = 50
+
+
+def redact_outbound_payload(payload: Any, *, force: bool = True, _depth: int = 0) -> Any:
+    """Recursively redact secrets from a request payload before it leaves the machine.
+
+    This is the hard, non-bypassable gate for outbound cloud-provider calls
+    (see ``chat_completion_helpers.build_api_kwargs``) — distinct from
+    ``redact_sensitive_text``, which is called piecemeal on individual log
+    lines / tool output. Here the *entire* api_kwargs structure (messages,
+    tool schemas, tool-call arguments, system prompt, everything) is walked
+    and every string leaf is passed through ``redact_sensitive_text``.
+
+    Content blocks shaped like image/audio attachments (``{"type":
+    "image_url", ...}`` and friends) are passed through untouched: regex
+    substitution on a base64 payload is wasted CPU on every request and can
+    corrupt the encoded bytes, and these blocks never carry credential-shaped
+    text — the secret-bearing fields live in ordinary string values
+    elsewhere in the same structure.
+
+    Structure-preserving: never adds, removes, or reorders keys/items, only
+    rewrites string values in place. Safe to wrap any provider's api_kwargs
+    dict regardless of shape — dicts, lists, and tuples are walked generically
+    rather than keyed on a provider-specific schema, so no dispatch branch can
+    silently bypass it by using an unrecognized field name.
+    """
+    if _depth > _MAX_REDACT_PAYLOAD_DEPTH:
+        logger.warning("redact_outbound_payload: max depth exceeded, leaving remainder unredacted")
+        return payload
+    if isinstance(payload, str):
+        return redact_sensitive_text(payload, force=force)
+    if isinstance(payload, dict):
+        if payload.get("type") in _MEDIA_BLOCK_TYPES:
+            return payload
+        return {
+            key: redact_outbound_payload(value, force=force, _depth=_depth + 1)
+            for key, value in payload.items()
+        }
+    if isinstance(payload, list):
+        return [redact_outbound_payload(item, force=force, _depth=_depth + 1) for item in payload]
+    if isinstance(payload, tuple):
+        return tuple(redact_outbound_payload(item, force=force, _depth=_depth + 1) for item in payload)
+    return payload
 
 
 # Commands whose stdout is an environment-variable dump (KEY=value lines),
