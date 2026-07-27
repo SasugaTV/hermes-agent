@@ -1,0 +1,13 @@
+{
+  "librekanban_export_path": "/path/to/backup_20260727_104400.librekanbanbackup.json",
+  "board_name": "Primary",
+  "google_credentials_path": "credentials.json",
+  "google_token_path": "token.json",
+  "state_path": "sync_state.json",
+  "google_tasklist_title": "Kanban: Primary",
+  "done_column_names": ["Finished", "Done", "Completed"],
+  "reopened_column_name": "To Do",
+  "new_task_column_name": "To Do",
+  "on_kanban_delete": "leave",
+  "on_google_delete": "leave"
+}

@@ -1,0 +1,96 @@
+{
+    "boards": [
+        {
+            "exportTimestamp": 1785119398342,
+            "board": {
+                "id": "9bb4a6a4-8b1a-48b4-a70d-d73ea12dc167",
+                "name": "Primary",
+                "description": "My Main Kanban Board",
+                "color": 4278228616,
+                "position": 1,
+                "createdAt": 1785118971104,
+                "updatedAt": 1785119287826,
+                "sourceId": "7769cbb0-92dd-4073-a21b-7e5368bbc770"
+            },
+            "columns": [
+                {
+                    "id": "38e16e5a-79e2-402b-a5eb-0a5d8c60db99",
+                    "boardId": "9bb4a6a4-8b1a-48b4-a70d-d73ea12dc167",
+                    "name": "To Do",
+                    "color": 4279858898,
+                    "position": 0
+                },
+                {
+                    "id": "9e6b2a6e-5853-48fc-9f1f-39345c067730",
+                    "boardId": "9bb4a6a4-8b1a-48b4-a70d-d73ea12dc167",
+                    "name": "Today",
+                    "color": 4294278144,
+                    "position": 1
+                },
+                {
+                    "id": "8c810b3b-5870-4996-be6a-a0a5b3542cdd",
+                    "boardId": "9bb4a6a4-8b1a-48b4-a70d-d73ea12dc167",
+                    "name": "Doing",
+                    "color": 4282339765,
+                    "position": 4
+                },
+                {
+                    "id": "c38d2dd5-4924-4cbf-8863-0fd355cdd7e7",
+                    "boardId": "9bb4a6a4-8b1a-48b4-a70d-d73ea12dc167",
+                    "name": "Finished",
+                    "color": 4281896508,
+                    "position": 5
+                }
+            ],
+            "tasks": [
+                {
+                    "id": "76a4a0aa-7be3-4f4f-88fe-a7d42885fb48",
+                    "boardId": "9bb4a6a4-8b1a-48b4-a70d-d73ea12dc167",
+                    "columnId": "8c810b3b-5870-4996-be6a-a0a5b3542cdd",
+                    "title": "Finish health check",
+                    "description": "I need to pick up my health check from the hospital. Clinic number 206.",
+                    "position": 0,
+                    "color": 4281150765,
+                    "priority": "NONE",
+                    "dueDate": 1785110400000,
+                    "createdAt": 1785119078086,
+                    "history": [
+                        {
+                            "id": "79cf842b-6b27-46ff-b18b-d2636247df3a",
+                            "taskId": "76a4a0aa-7be3-4f4f-88fe-a7d42885fb48",
+                            "changeType": "moved",
+                            "fieldName": "column",
+                            "oldValue": "To Do",
+                            "newValue": "Doing",
+                            "createdAt": 1785119084227
+                        },
+                        {
+                            "id": "a4ac0af5-cb23-47b4-83f4-e7843d14722b",
+                            "taskId": "76a4a0aa-7be3-4f4f-88fe-a7d42885fb48",
+                            "changeType": "created",
+                            "fieldName": null,
+                            "oldValue": null,
+                            "newValue": null,
+                            "createdAt": 1785119078117
+                        }
+                    ],
+                    "storyPoints": 5.0
+                }
+            ],
+            "tags": [
+                {
+                    "id": "a0a4bc82-9bb3-428c-adf8-7ee93d9da886",
+                    "boardId": "9bb4a6a4-8b1a-48b4-a70d-d73ea12dc167",
+                    "name": "Health",
+                    "color": 4280391411
+                },
+                {
+                    "id": "21eab454-ba2e-4dd4-9cac-974b2cde40bb",
+                    "boardId": "9bb4a6a4-8b1a-48b4-a70d-d73ea12dc167",
+                    "name": "Work",
+                    "color": 4280391411
+                }
+            ]
+        }
+    ]
+}
