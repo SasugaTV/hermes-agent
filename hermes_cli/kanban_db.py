@@ -966,7 +966,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Unix timestamp at which a ``scheduled`` task becomes due. The dispatcher
+    -- wakes it on the first tick at or after this instant, routing it through
+    -- the same resume path as a manual unblock. NULL = parked indefinitely (the
+    -- pre-``wake_at`` behaviour): only a human or a cron re-gates it.
+    wake_at              INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -3532,9 +3537,12 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         # unbounded; only complete_task clears them. ``consecutive_failures``
         # (the dispatcher's spawn/crash counter) IS reset — a deliberate unblock
         # is a fresh start for the retry budget.
+        # ``wake_at`` is cleared here: once the task has left ``scheduled`` the
+        # timer has been consumed (whether it fired or a human pre-empted it),
+        # and a surviving timestamp would re-fire on a later re-schedule.
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "consecutive_failures = 0, last_failure_error = NULL "
+            "consecutive_failures = 0, last_failure_error = NULL, wake_at = NULL "
             "WHERE id = ? AND status IN ('blocked', 'scheduled')", (new_status, task_id),
         )
         if cur.rowcount != 1:
@@ -3816,18 +3824,24 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
 
 def schedule_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
-    expected_run_id: Optional[int] = None,
+    expected_run_id: Optional[int] = None, wake_at: Optional[int] = None,
 ) -> bool:
-    """Park in ``scheduled`` (waiting on time, not a human; not dispatchable)
-    until ``unblock_task`` re-gates it."""
+    """Park in ``scheduled`` (waiting on time, not a human; not dispatchable).
+
+    With ``wake_at`` (a unix timestamp) the dispatcher re-gates the task on the
+    first tick at or after that instant. Without one the task waits for
+    :func:`unblock_task` — a human or a cron — exactly as before.
+    """
+    wake_ts = int(wake_at) if wake_at is not None else None
     with write_txn(conn):
-        params: list[Any] = [task_id]
+        params: list[Any] = [wake_ts, task_id]
         sql = """
             UPDATE tasks
                SET status       = 'scheduled',
                    claim_lock   = NULL,
                    claim_expires= NULL,
-                   worker_pid   = NULL
+                   worker_pid   = NULL,
+                   wake_at      = ?
              WHERE id = ?
                AND status IN ('todo', 'ready', 'running', 'blocked')
         """
@@ -3839,8 +3853,46 @@ def schedule_task(
         run_id = _end_or_synthesize_run(
             conn, task_id, outcome="scheduled", status="scheduled", summary=reason, synthesize=bool(reason),
         )
-        _append_event(conn, task_id, "scheduled", {"reason": reason}, run_id=run_id)
+        # ``wake_at`` appears in the payload only when a timer was set, so an
+        # untimed park keeps the exact event shape consumers already parse.
+        payload = {"reason": reason}
+        if wake_ts is not None:
+            payload["wake_at"] = wake_ts
+        _append_event(conn, task_id, "scheduled", payload, run_id=run_id)
         return True
+
+
+def wake_due_scheduled_tasks(
+    conn: sqlite3.Connection, *, now: Optional[int] = None, limit: int = 100,
+) -> list[str]:
+    """Re-gate every ``scheduled`` task whose ``wake_at`` has arrived.
+
+    Routes through :func:`unblock_task` so a timer wake and a human unblock are
+    the same operation — parent gating, dangling-run reclaim and the retry-budget
+    reset all behave identically. Tasks with no ``wake_at`` are never touched.
+    Returns the ids actually woken, and is safe to call on every dispatcher tick.
+    """
+    ts = int(now if now is not None else time.time())
+    due = [
+        row["id"]
+        for row in conn.execute(
+            "SELECT id FROM tasks "
+            " WHERE status = 'scheduled' AND wake_at IS NOT NULL AND wake_at <= ? "
+            " ORDER BY wake_at ASC LIMIT ?",
+            (ts, int(limit)),
+        )
+    ]
+    woken: list[str] = []
+    for task_id in due:
+        # A concurrent dispatcher (or a human clicking Unblock) may have moved
+        # the row out of ``scheduled`` since the scan; unblock_task returns
+        # False in that case and the id is simply skipped.
+        if not unblock_task(conn, task_id):
+            continue
+        with write_txn(conn):
+            _append_event(conn, task_id, "woke", {"wake_at": ts})
+        woken.append(task_id)
+    return woken
 
 
 # --- Worker context builder (what a spawned worker sees) ---

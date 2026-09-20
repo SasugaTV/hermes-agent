@@ -835,6 +835,8 @@ _LATER_TASK_COLUMNS = (
     # Typed block reason (VALID_BLOCK_KINDS); NULL = generic human blocker.
     ("block_kind", "block_kind TEXT"),
     ("block_recurrences", "block_recurrences INTEGER NOT NULL DEFAULT 0"),
+    # Due time for a ``scheduled`` task; NULL = parked until a human re-gates it.
+    ("wake_at", "wake_at INTEGER"),
     # Spawn-time start fingerprint of worker_pid (PID-reuse guard; NULL = legacy row).
     ("worker_started_at", "worker_started_at INTEGER"),
 )
@@ -902,6 +904,12 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_tenant ON tasks(tenant)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_idempotency ON tasks(idempotency_key)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)")
+    # Partial: only ``scheduled`` rows carry a timer, so the dispatcher's
+    # per-tick due-scan stays O(due rows) instead of O(board).
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_wake_at ON tasks(wake_at) "
+        "WHERE status = 'scheduled' AND wake_at IS NOT NULL"
+    )
 
     # task_events.run_id back-fills as NULL for historical events (they predate
     # runs and can't be attributed).
