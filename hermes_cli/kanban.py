@@ -986,10 +986,17 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
     reason = _joined_words(args.reason)
     author = _profile_author()
     ids = _bulk_ids(args)
+    try:
+        delay = _parse_duration(getattr(args, "wake_in", None))
+    except ValueError as exc:
+        return _err(str(exc))
+    wake_at = int(time.time()) + delay if delay is not None else None
     suffix = f": {reason}" if reason else ""
+    if wake_at is not None:
+        suffix += f" (wakes in {args.wake_in})"
     with kbc.connect_closing() as conn:
         op = _commented(conn, reason, author, "SCHEDULED", lambda tid: kb.schedule_task(
-            conn, tid, reason=reason, expected_run_id=_worker_run_id_for(tid)))
+            conn, tid, reason=reason, expected_run_id=_worker_run_id_for(tid), wake_at=wake_at))
         return _bulk_apply(ids, op, lambda tid: f"Scheduled {tid}{suffix}", lambda tid: f"cannot schedule {tid}")
 
 

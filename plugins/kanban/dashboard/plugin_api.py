@@ -495,6 +495,9 @@ class UpdateTaskBody(BaseModel):
     body: Optional[str] = None
     result: Optional[str] = None
     block_reason: Optional[str] = None
+    # Seconds from now after which a task moved to 'scheduled' wakes itself.
+    # None = park indefinitely (only a human or a cron re-gates it).
+    wake_in_seconds: Optional[int] = None
     # Handoff fields forwarded to complete_task on -> 'done' (parity with ``hermes kanban complete``).
     summary: Optional[str] = None
     metadata: Optional[dict] = None
@@ -545,6 +548,19 @@ def _drag_to(conn, task_id: str, s: str) -> bool:
     return _set_status_direct(conn, task_id, s)
 
 
+def _wake_at_from(payload: Any) -> Optional[int]:
+    """Absolute wake time from the body's relative ``wake_in_seconds``; None when
+    unset or non-positive (a past/zero delay is a park, not an instant wake)."""
+    delay = getattr(payload, "wake_in_seconds", None)
+    if delay is None:
+        return None
+    try:
+        delay = int(delay)
+    except (TypeError, ValueError):
+        return None
+    return int(time.time()) + delay if delay > 0 else None
+
+
 # Status verb dispatch shared by PATCH /tasks/{id} and POST /tasks/bulk: (conn, task_id,
 # payload) -> ok. ``review`` uses request_review (never a block, so it can't trip unblock-loop
 # detection) and ``done`` pass ``force=True``: a dashboard action is a human override of a live worker claim.
@@ -552,7 +568,8 @@ _STATUS_HANDLERS: dict[str, Any] = {
     "done": lambda conn, tid, p: kanban_db.complete_task(
         conn, tid, result=p.result, summary=p.summary, metadata=p.metadata, force=True),
     "blocked": lambda conn, tid, p: kanban_db.block_task(conn, tid, reason=getattr(p, "block_reason", None)),
-    "scheduled": lambda conn, tid, p: kanban_db.schedule_task(conn, tid, reason=getattr(p, "block_reason", None)),
+    "scheduled": lambda conn, tid, p: kanban_db.schedule_task(
+        conn, tid, reason=getattr(p, "block_reason", None), wake_at=_wake_at_from(p)),
     "review": lambda conn, tid, p: kanban_db.request_review(
         conn, tid, summary=p.summary, metadata=p.metadata, reviewer=(p.assignee or None), force=True),
     "ready": lambda conn, tid, p: _drag_to(conn, tid, "ready"),

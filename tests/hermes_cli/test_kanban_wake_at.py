@@ -153,6 +153,59 @@ def test_dispatch_tick_leaves_untimed_parks_alone(kanban_home):
 
 
 # ---------------------------------------------------------------------------
+# Entry points
+# ---------------------------------------------------------------------------
+
+
+def test_task_view_exposes_wake_at(kanban_home):
+    """The dashboard reads the timer off the Task view, not the raw row."""
+    now = int(time.time())
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="visible timer", assignee="ops")
+        kb.schedule_task(conn, t, wake_at=now + 42)
+        assert kb.get_task(conn, t).wake_at == now + 42
+        kb.wake_due_scheduled_tasks(conn, now=now + 43)
+        assert kb.get_task(conn, t).wake_at is None
+
+
+@pytest.mark.parametrize(
+    "text,seconds",
+    [("30s", 30), ("5m", 300), ("2h", 7200), ("1d", 86400), ("90", 90)],
+)
+def test_cli_wake_in_accepts_the_usual_duration_forms(text, seconds):
+    from hermes_cli.kanban import _parse_duration
+
+    assert _parse_duration(text) == seconds
+
+
+def test_cli_wake_in_rejects_garbage():
+    from hermes_cli.kanban import _parse_duration
+
+    with pytest.raises(ValueError):
+        _parse_duration("soon")
+
+
+def test_dashboard_wake_in_seconds_becomes_an_absolute_time():
+    from plugins.kanban.dashboard.plugin_api import _wake_at_from
+
+    class _Body:
+        wake_in_seconds = 3600
+
+    assert abs(_wake_at_from(_Body()) - (int(time.time()) + 3600)) <= 2
+
+
+@pytest.mark.parametrize("value", [None, 0, -5, "nonsense"])
+def test_dashboard_absent_or_bad_delay_parks_indefinitely(value):
+    """An unset, zero, negative or malformed delay must not invent a timer."""
+    from plugins.kanban.dashboard.plugin_api import _wake_at_from
+
+    class _Body:
+        wake_in_seconds = value
+
+    assert _wake_at_from(_Body()) is None
+
+
+# ---------------------------------------------------------------------------
 # Migration
 # ---------------------------------------------------------------------------
 

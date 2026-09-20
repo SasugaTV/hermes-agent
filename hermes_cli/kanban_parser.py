@@ -307,6 +307,11 @@ _SPECS = [
     _cmd("schedule", [
         _TASK_ID,
         _arg("reason", nargs="*", help="Reason/timing note (also appended as a comment)"),
+        _arg("--wake-in", dest="wake_in",
+             help="Wake the task automatically after this delay (30s, 5m, 2h, 1d, or "
+                  "seconds). The dispatcher returns it to ready on the first tick at or "
+                  "after that time. Omit to park indefinitely — only a human or a cron "
+                  "gets it back."),
         _bulk_ids("schedule"),
     ], help="Park one or more tasks in Scheduled (waiting on time, not human input)"),
     _cmd("unblock", [
